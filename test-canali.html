@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Test canali audio — DJI</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;900&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{
+    background:#0B0D12;color:#fff;font-family:'Archivo',system-ui,sans-serif;
+    min-height:100vh;padding:24px 20px calc(24px + env(safe-area-inset-bottom));
+  }
+  .eyebrow{font-size:10px;letter-spacing:.28em;text-transform:uppercase;color:#7C8496;font-weight:900;margin-bottom:18px}
+  h1{font-size:24px;font-weight:900;line-height:1.15;margin-bottom:10px}
+  p.sub{color:#9AA0AC;font-size:14px;line-height:1.55;margin-bottom:22px}
+
+  button{
+    width:100%;background:#fff;color:#000;border:none;border-radius:12px;
+    padding:18px;font-family:inherit;font-size:14px;font-weight:900;
+    letter-spacing:.1em;text-transform:uppercase;cursor:pointer;margin-bottom:20px;
+  }
+  button:disabled{opacity:.4}
+
+  .info{
+    border:1px solid #262B36;border-radius:12px;padding:16px;margin-bottom:16px;
+    font-family:ui-monospace,monospace;font-size:13px;line-height:1.9;color:#9AA0AC;
+  }
+  .info b{color:#fff;font-weight:700}
+  .info .ok{color:#5FE8A0}
+  .info .no{color:#FF7A6E}
+  .row{display:flex;justify-content:space-between;gap:12px}
+
+  /* misuratori dei due canali */
+  .meters{display:flex;gap:16px;margin-bottom:20px}
+  .ch{flex:1;text-align:center}
+  .ch .name{font-size:11px;letter-spacing:.2em;text-transform:uppercase;font-weight:900;color:#7C8496;margin-bottom:8px}
+  .bar{height:180px;background:#171A21;border-radius:10px;position:relative;overflow:hidden;border:1px solid #262B36}
+  .fill{position:absolute;left:0;right:0;bottom:0;background:linear-gradient(to top,#5FE8A0,#E8B33A);height:0%;transition:height .05s linear}
+  .ch.L .fill{background:linear-gradient(to top,#5FD3E8,#4ED0C8)}
+  .ch.R .fill{background:linear-gradient(to top,#E8B33A,#E2564A)}
+  .pct{margin-top:8px;font-family:ui-monospace,monospace;font-size:20px;font-weight:700}
+
+  .verdict{
+    border-radius:12px;padding:18px;font-size:15px;line-height:1.55;font-weight:700;
+    display:none;
+  }
+  .verdict.show{display:block}
+  .verdict.good{background:rgba(95,232,160,.12);border:1px solid rgba(95,232,160,.4);color:#8affc0}
+  .verdict.bad{background:rgba(255,122,110,.12);border:1px solid rgba(255,122,110,.4);color:#ffb0a8}
+
+  .hint{font-size:13px;color:#7C8496;line-height:1.6;margin-top:14px}
+</style>
+</head>
+<body>
+  <div class="eyebrow">Dietro le quinte · diagnostica</div>
+  <h1>Test canali audio</h1>
+  <p class="sub">Verifica se il tablet riceve i due trasmettitori DJI come canali separati. Imposta il DJI in modalità <b>Stereo</b> (S) nell'app DJI Mimo, collega il ricevitore, poi avvia.</p>
+
+  <button id="start">Avvia il test</button>
+
+  <div class="info" id="info">
+    <div class="row"><span>Stato</span><b id="state">in attesa</b></div>
+    <div class="row"><span>Dispositivo</span><b id="dev">—</b></div>
+    <div class="row"><span>Canali ricevuti</span><b id="chans">—</b></div>
+  </div>
+
+  <div class="meters">
+    <div class="ch L">
+      <div class="name">Sinistra · TX1</div>
+      <div class="bar"><div class="fill" id="fillL"></div></div>
+      <div class="pct" id="pctL">0</div>
+    </div>
+    <div class="ch R">
+      <div class="name">Destra · TX2</div>
+      <div class="bar"><div class="fill" id="fillR"></div></div>
+      <div class="pct" id="pctR">0</div>
+    </div>
+  </div>
+
+  <div class="verdict" id="verdict"></div>
+
+  <p class="hint">Prova così: parla (o batti le dita) in <b>un solo</b> trasmettitore per volta. Se si muove solo la barra corrispondente, i canali sono separati. Se si muovono entrambe insieme, il tablet ha unito l'audio in mono.</p>
+
+<script>
+const $ = id => document.getElementById(id);
+let ctx, analyserL, analyserR, raf;
+let sawL = false, sawR = false, sawSplit = false;
+
+$('start').onclick = async () => {
+  $('start').disabled = true;
+  $('state').textContent = 'richiesta microfono…';
+
+  let stream;
+  try{
+    // chiediamo esplicitamente 2 canali, senza elaborazioni che possano rimixare
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio:{
+        channelCount:{ ideal:2 },
+        echoCancellation:false,
+        noiseSuppression:false,
+        autoGainControl:false
+      }
+    });
+  }catch(err){
+    $('state').innerHTML = '<span class="no">microfono negato</span>';
+    $('start').disabled = false;
+    return;
+  }
+
+  // che dispositivo è
+  const track = stream.getAudioTracks()[0];
+  $('dev').textContent = (track.label || 'sconosciuto').slice(0,22);
+  const settings = track.getSettings ? track.getSettings() : {};
+  const declaredCh = settings.channelCount || '?';
+
+  const AC = window.AudioContext || window.webkitAudioContext;
+  ctx = new AC();
+  const src = ctx.createMediaStreamSource(stream);
+
+  // splitter per leggere i due canali separatamente
+  const splitter = ctx.createChannelSplitter(2);
+  src.connect(splitter);
+
+  const realCh = src.channelCount;
+  $('chans').textContent = `dichiarati ${declaredCh}, reali ${realCh}`;
+
+  analyserL = ctx.createAnalyser(); analyserL.fftSize = 512;
+  analyserR = ctx.createAnalyser(); analyserR.fftSize = 512;
+  splitter.connect(analyserL, 0);
+  splitter.connect(analyserR, 1);
+
+  $('state').innerHTML = '<span class="ok">in ascolto — parla nei microfoni</span>';
+  loop();
+};
+
+function level(analyser){
+  const buf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(buf);
+  let peak = 0;
+  for(let i=0;i<buf.length;i++){
+    const v = Math.abs(buf[i] - 128);
+    if(v > peak) peak = v;
+  }
+  return Math.min(100, Math.round(peak / 128 * 100 * 2));
+}
+
+function loop(){
+  const l = level(analyserL);
+  const r = level(analyserR);
+  $('fillL').style.height = l + '%';
+  $('fillR').style.height = r + '%';
+  $('pctL').textContent = l;
+  $('pctR').textContent = r;
+
+  if(l > 12) sawL = true;
+  if(r > 12) sawR = true;
+  // separazione osservata: un canale molto più alto dell'altro
+  if(Math.abs(l - r) > 25 && (l > 20 || r > 20)) sawSplit = true;
+
+  updateVerdict();
+  raf = requestAnimationFrame(loop);
+}
+
+function updateVerdict(){
+  const v = $('verdict');
+  if(sawSplit){
+    v.className = 'verdict show good';
+    v.innerHTML = '✓ Canali SEPARATI. Il tablet riceve i due trasmettitori distinti. ' +
+      'Puoi usare la versione a due canali: TX sinistra = tu, TX destra = artista.';
+  } else if(sawL && sawR){
+    v.className = 'verdict show bad';
+    v.innerHTML = '△ Finora sembra MONO: entrambe le barre si muovono insieme. ' +
+      'Prova a parlare in un solo trasmettitore. Se l\'altra barra sale comunque, ' +
+      'il tablet ha unito i canali — resta il rilevamento lingua.';
+  }
+}
+</script>
+</body>
+</html>
